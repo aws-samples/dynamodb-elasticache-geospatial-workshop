@@ -1,0 +1,20 @@
+/* .card-img-top{
+    height: 100px;
+    width: 100px;
+} */
+
+.slick-slide.slick-center .card{
+    transform: scale(1);
+  }
+
+.slick-slide .card {
+    transform: scale(0.75);
+    cursor: pointer;
+}
+
+.mapboxgl-popup-content{
+    background-color: transparent !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+}
+

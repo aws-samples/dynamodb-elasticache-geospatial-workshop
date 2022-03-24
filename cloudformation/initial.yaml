@@ -1,0 +1,699 @@
+AWSTemplateFormatVersion: 2010-09-09
+# RESOURCES
+Resources:
+
+  # =========================
+  # VPC
+  # =========================
+
+  # WORKSHOP VPC
+  WorkshopVPC:
+    Type: 'AWS::EC2::VPC'
+    DependsOn: DynamoDBTable
+    Properties:
+      CidrBlock: 172.31.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  
+  # FIRST SUBNET 0-63 ADD TO FIRST AZ
+  Subnet1:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: WorkshopVPC
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      AvailabilityZone: 
+        Fn::Select: 
+          - 0
+          - Fn::GetAZs: ""
+      CidrBlock: 172.31.0.0/26
+      MapPublicIpOnLaunch: true
+  
+  # SECOND SUBNET 64-127 ADD TO SECOND AZ
+  Subnet2:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: WorkshopVPC
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      AvailabilityZone: 
+        Fn::Select: 
+          - 1
+          - Fn::GetAZs: ""
+      CidrBlock: 172.31.0.64/26
+      MapPublicIpOnLaunch: true
+
+  # THIRD SUBNET 128-191 ADD TO THIRD AZ
+  Subnet3:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: WorkshopVPC
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      AvailabilityZone: 
+        Fn::Select: 
+          - 2
+          - Fn::GetAZs: ""
+      CidrBlock: 172.31.0.128/26
+      MapPublicIpOnLaunch: true
+
+  # ROUTE TABLE (RT)
+  RouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    DependsOn: 
+      - Subnet1
+      - Subnet2
+      - Subnet3
+    Properties:
+      VpcId: !Ref WorkshopVPC
+  
+  # ASSOC SUBS 1 TO RT
+  Subnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    DependsOn: RouteTable
+    Properties:
+      SubnetId: !Ref Subnet1
+      RouteTableId: !Ref RouteTable
+  
+  # ASSOC SUBS 2 TO RT
+  Subnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    DependsOn: RouteTable
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref RouteTable
+
+  # ASSOC SUBS 3 TO RT
+  Subnet3RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    DependsOn: RouteTable
+    Properties:
+      SubnetId: !Ref Subnet3
+      RouteTableId: !Ref RouteTable
+
+  # SECURITY GROUP THAT ALLOWS ACCESS FROM ANY MEMBER (SELF REFERENCING)
+  InboundFromMembersSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: WorkshopVPC
+    Properties:
+      GroupDescription: "Allow access from any member"
+      VpcId: !Ref WorkshopVPC
+
+  # SECURITY GROUP INGRESS RULES
+  AllowFromSelfSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: WorkshopVPC
+    Properties:
+      GroupId: !Ref InboundFromMembersSecGroup
+      IpProtocol: tcp
+      FromPort: '0'
+      ToPort: '65535'
+      SourceSecurityGroupId: !Ref InboundFromMembersSecGroup
+
+  # SECRETS MANAGER VPC ENDPOINT SO REQUESTS STAY INTERNAL
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn: RouteTable
+    Properties:
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref InboundFromMembersSecGroup
+      ServiceName:
+        !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcId: !Ref WorkshopVPC
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+
+  # DYNAMODB VPC ENDPOINT SO REQUESTS STAY INTERNAL
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn: WorkshopVPC
+    Properties:
+      RouteTableIds:
+        - !Ref RouteTable
+      ServiceName:
+        !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcId: !Ref WorkshopVPC
+      PolicyDocument: {
+        "Id": "Policy",
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "Statement",
+            "Action": "dynamodb:*",
+            "Effect": "Allow",
+            "Resource": !GetAtt "DynamoDBTable.Arn", 
+            "Principal": "*"
+          }
+        ]
+      }
+
+  # =========================
+  # DYNAMODB
+  # =========================
+
+  # PROPERTIES TABLE IN ON-DEMAND MODE WITH STREAM ENABLED
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - 
+          AttributeName: "pk"
+          AttributeType: "S"
+        - 
+          AttributeName: "sk"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "pk"
+          KeyType: "HASH"
+        - 
+          AttributeName: "sk"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification: 
+         StreamViewType: NEW_AND_OLD_IMAGES
+
+
+  # =========================
+  # Lambda
+  # =========================
+
+  # ALL FUNCTIONS CREATED IN VPC WITH NO INTERNET ACCESS
+  # CFN DOWNLOADS CODE FROM ZIP FILE LOCATED ON S3
+
+  # PROPERTY UPDATE LAMBDA FUNCTION TO UPDATE DYNAMODB ITEMS
+  LambdaFunctionTableUpdate:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaIAMRole
+    Properties: 
+      FunctionName: !Join [ "", [ !Ref AWS::StackName, 'LambdaFunctionTableUpdate' ] ]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt "LambdaIAMRole.Arn"
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::GetAtt:
+              - "InboundFromMembersSecGroup"
+              - "GroupId"
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Code: 
+        S3Bucket: lhnng-workshop
+        S3Key: lambda/property-table-update.zip
+      Runtime: python3.8
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTable
+
+  # PERMISSIONS FOR PROPERTY UPDATE LAMBDA TO ALLOW APIGW TO INVOKE IT
+  LambdaFunctionTableUpdatePermission:
+    Type: "AWS::Lambda::Permission"
+    DependsOn: LambdaFunctionTableUpdate
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "LambdaFunctionTableUpdate.Arn"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WorkshopAPI}/*/POST/property-update"
+
+
+  # PROPERTY CACHE UPDATE - CONSUMES DYNAMODB STREAM AND UPDATES REDIS
+  LambdaFunctionCachePopulate:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - LambdaIAMRole
+      - PropertyCacheReplicationGroup
+    Properties: 
+      FunctionName: !Join [ "", [ !Ref AWS::StackName, 'LambdaFunctionCachePopulate' ] ]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt "LambdaIAMRole.Arn"
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::GetAtt:
+              - "InboundFromMembersSecGroup"
+              - "GroupId"
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Code: 
+        S3Bucket: lhnng-workshop
+        S3Key: lambda/property-cache-populate.zip
+      Runtime: python3.8
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          EC_CLUSTER_ENDPOINT: !GetAtt PropertyCacheReplicationGroup.PrimaryEndPoint.Address
+          EC_SECRET_ARN: !Ref ElastiCacheCredentialSecret
+          GEO_INDEX_KEY: "property_index"
+
+  # DYNAMODB - LAMBDA EVENT SOURCE MAPPING
+  LambdaSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: LambdaFunctionCachePopulate
+    Properties: 
+      BatchSize: 10
+      BisectBatchOnFunctionError: True
+      Enabled: True
+      EventSourceArn:
+         Fn::GetAtt:
+          - "DynamoDBTable"
+          - "StreamArn"
+      FunctionName:
+        Fn::GetAtt:
+          - "LambdaFunctionCachePopulate"
+          - "Arn"
+      MaximumRetryAttempts: 5
+      StartingPosition: LATEST
+
+  # PROPERTY CACHE QUERY - GET PROPERTIES - GET PROPERTY DETAILS
+  LambdaFunctionCacheQuery:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - LambdaIAMRole
+      - PropertyCacheReplicationGroup
+    Properties: 
+      FunctionName: !Join [ "", [ !Ref AWS::StackName, 'LambdaFunctionCacheQuery' ] ]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt "LambdaIAMRole.Arn"
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::GetAtt:
+              - "InboundFromMembersSecGroup"
+              - "GroupId"
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Code: 
+        S3Bucket: lhnng-workshop
+        S3Key: lambda/property-cache-query.zip
+      Runtime: python3.8
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          EC_CLUSTER_ENDPOINT: !GetAtt PropertyCacheReplicationGroup.PrimaryEndPoint.Address
+          EC_SECRET_ARN: !Ref ElastiCacheCredentialSecret
+          GEO_INDEX_KEY: "property_index"
+
+  # PERMISSIONS FOR PROPERTY CACHE QUERY LAMBDA TO ALLOW APIGW TO INVOKE IT
+  LambdaFunctionCacheQueryPermission:
+    Type: "AWS::Lambda::Permission"
+    DependsOn: LambdaFunctionCacheQuery
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "LambdaFunctionCacheQuery.Arn"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WorkshopAPI}/*/POST/*"
+
+
+  # ROLE FOR LAMBDA FUNCTIONS
+  LambdaIAMRole:
+    Type: "AWS::IAM::Role"
+    DependsOn: Subnet2RouteTableAssociation
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess' # TODO refine access
+
+
+  # LOG GROUP FOR LAMBDA TO WRITE CLOUDWATCH LOGS FOR DEBUGGING
+  LambdaLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Join [ "", [ !Ref AWS::StackName, 'LambdaLogGroup' ] ]
+      RetentionInDays: 30
+
+  # =========================
+  # API GATEWAY
+  # =========================
+
+  # API GW REST API
+  WorkshopAPI:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: !Join [ "", [ !Ref AWS::StackName, 'API' ] ]
+      Description: "Workshop API"
+
+  # API GW DEPLOYMENT WITH STAGE
+  ApiGatewayDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - UpdatePropertyMethod
+      - GetPropertiesMethod
+    Properties:
+      RestApiId: !Ref WorkshopAPI
+      StageName: workshop
+
+  # APIGW KEY FOR REFINED ACCESS
+  ApiKey:
+    Type: 'AWS::ApiGateway::ApiKey'
+    DependsOn: 
+      - ApiGatewayDeployment
+      - WorkshopAPI
+    Properties:
+      Name: WorkshopApiKey
+      Description: Workshop API Key
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref WorkshopAPI
+          StageName: workshop
+
+  # APIGW USAGE PLAN | NEEDED TO ADD API KEY FOR AUTH
+  ApiUsagePlan:
+    Type: "AWS::ApiGateway::UsagePlan"
+    DependsOn: ApiGatewayDeployment
+    Properties:
+      ApiStages: 
+      - ApiId: !Ref WorkshopAPI
+        Stage: workshop    
+      Description: !Join [" ", [{"Ref": "AWS::StackName"}, "usage plan"]]
+      UsagePlanName: !Join ["", [{"Ref": "AWS::StackName"}, "-usage-plan"]]
+  
+  # APIGW USAGE PLAN KEY | ASSOC API KEY TO USAGE PLAN
+  ApiUsagePlanKey:
+    Type: "AWS::ApiGateway::UsagePlanKey"
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  # APIGW RESOURCE FOR PROPERTY-UPDATE
+  UpdateProperty:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref "WorkshopAPI"
+      ParentId: !GetAtt 
+        - WorkshopAPI
+        - RootResourceId
+      PathPart: property-update
+
+  # APIGW RESOURCE FOR PROPERTY-SEARCH
+  GetProperties:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref "WorkshopAPI"
+      ParentId: !GetAtt 
+        - WorkshopAPI
+        - RootResourceId
+      PathPart: property-search
+
+  # APIGW RESOURCE FOR PROPERTY-DETAIL
+  GetPropertyDetails:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref "WorkshopAPI"
+      ParentId: !GetAtt 
+        - WorkshopAPI
+        - RootResourceId
+      PathPart: property-detail
+
+  # API METHOD FOR PROPERTY-UPDATE
+  UpdatePropertyMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "POST"
+      ApiKeyRequired: true
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !GetAtt "LambdaFunctionTableUpdate.Arn"
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Requested-With'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+      ResourceId: !Ref "UpdateProperty"
+      RestApiId: !Ref "WorkshopAPI"
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # API OPTIONS METHOD FOR PROPERTY-UPDATE PRE-FLIGHT REQUEST CHECK
+  UpdatePropertyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      ResourceId: !Ref "UpdateProperty"
+      RestApiId: !Ref "WorkshopAPI"
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # API METHOD FOR PROPERTY-SEARCH
+  GetPropertiesMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "POST"
+      ApiKeyRequired: true
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !GetAtt "LambdaFunctionCacheQuery.Arn"
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Requested-With'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+      ResourceId: !Ref "GetProperties"
+      RestApiId: !Ref "WorkshopAPI"
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # API OPTIONS METHOD FOR PROPERTY-SEARCH PRE-FLIGHT REQUEST CHECK
+  GetPropertiesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      ResourceId: !Ref "GetProperties"
+      RestApiId: !Ref "WorkshopAPI"
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+
+  # API METHOD FOR PROPERTY-DETAIL
+  GetDetailsMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "POST"
+      ApiKeyRequired: true
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !GetAtt "LambdaFunctionCacheQuery.Arn"
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Requested-With'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+      ResourceId: !Ref "GetPropertyDetails"
+      RestApiId: !Ref "WorkshopAPI"
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'*'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  # API OPTIONS METHOD FOR PROPERTY-DETAIL PRE-FLIGHT REQUEST CHECK
+  GetDetailsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      ResourceId: !Ref "GetPropertyDetails"
+      RestApiId: !Ref "WorkshopAPI"
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+  
+
+  # =========================
+  # SECRETS MANAGER
+  # =========================
+
+  # CREDENTIALS USED TO ACCESS REDIS
+  ElastiCacheCredentialSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: 
+      Description: "Contains credential information for the Redis user"
+      GenerateSecretString: 
+        SecretStringTemplate: '{"username": "workshopuser"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+      Name: 'CacheCredSecret'
+
+  # =========================
+  # ELASTICACHE - REDIS
+  # =========================
+
+  # USER FOR ACCESSING REDIS
+  PropertyCacheUser:
+    Type: AWS::ElastiCache::User
+    DependsOn: ElastiCacheCredentialSecret
+    Properties: 
+      AccessString: 'on ~* +@all'
+      Engine: redis
+      NoPasswordRequired: false
+      Passwords: ['{{resolve:secretsmanager:CacheCredSecret:SecretString:password}}']
+      UserId: '{{resolve:secretsmanager:CacheCredSecret:SecretString:username}}'
+      UserName: '{{resolve:secretsmanager:CacheCredSecret:SecretString:username}}'
+
+  # USER GROUP FOR ACCESSING REDIS
+  PropertyCacheUserGroup:
+    Type: AWS::ElastiCache::UserGroup
+    DependsOn: PropertyCacheUser
+    Properties: 
+      Engine: redis
+      UserGroupId: 'property-cache-user-group'
+      UserIds: ['default', 'workshopuser']
+  
+  # REDIS CLUSTER SUBNET GROUP
+  PropertyCacheSubnetGroup:
+    Type: 'AWS::ElastiCache::SubnetGroup'
+    Properties:
+      Description: !Ref 'AWS::StackName'
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+
+  # REDIS CLUSTER
+  PropertyCacheReplicationGroup:
+    Type: 'AWS::ElastiCache::ReplicationGroup'
+    DependsOn: [PropertyCacheUserGroup, PropertyCacheSubnetGroup]
+    Properties:
+      AtRestEncryptionEnabled: true
+      AutomaticFailoverEnabled: true  
+      CacheNodeType: cache.r6g.large 
+      CacheParameterGroupName: default.redis6.x
+      CacheSubnetGroupName: !Ref PropertyCacheSubnetGroup
+      Engine: redis
+      EngineVersion: '6.2'
+      MultiAZEnabled: true
+      Port: 6379
+      ReplicasPerNodeGroup: '2'
+      ReplicationGroupDescription: 'Cache for properties'
+      SecurityGroupIds:
+        - !Ref InboundFromMembersSecGroup
+      TransitEncryptionEnabled: true
+      UserGroupIds: ['property-cache-user-group']       
+
+# OUTPUTS
+Outputs:
+
+  # API ENDPOINT URL
+  ApiGatewayInvokeURL:
+    Value: !Sub "https://${WorkshopAPI}.execute-api.${AWS::Region}.amazonaws.com/workshop"
+    Description: Endpoint for API 
+
+  # DYNAMODB TABLE ARN
+  DynamoDBTable:
+    Value: !GetAtt "DynamoDBTable.Arn"
+    Description: DDB Table ARN
+
+  # API ENDPOINT URL
+  CacheEndpoint:
+    Value: !GetAtt PropertyCacheReplicationGroup.PrimaryEndPoint.Address 
