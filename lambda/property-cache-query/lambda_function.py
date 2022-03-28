@@ -77,10 +77,10 @@ def lambda_handler(event, context):
      # Retrieve a property's details from the cache
      elif request_path.endswith('detail'):
           # Get the property key from the request body
-          search_latitude = request_body['property_key']
+          property_key = request_body['property_key']
 
           # Retrieve the details for this property key
-          results = redis_client.hgetall(search_latitude)
+          results = redis_client.hgetall(property_key)
 
      # Create the response to return to API Gateway
      response = {}
